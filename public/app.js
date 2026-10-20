@@ -468,7 +468,8 @@ function focusSearch() {
 
 /* ---------- events ---------- */
 document.addEventListener('click', (e) => {
-  const t = e.target.closest('[data-toggle],[data-back],[data-view]');
+  // .nav-row only: <body> also carries data-view, and would turn every click into navigation.
+  const t = e.target.closest('[data-toggle],[data-back],.nav-row[data-view]');
   if (!t) return;
   if (t.dataset.toggle) toggle(t.dataset.toggle);
   else if (t.dataset.back === 'nav') go('#/menu');
