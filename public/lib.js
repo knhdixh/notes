@@ -10,7 +10,8 @@ const WORD = /[\p{L}\p{N}][\p{L}\p{N}'’_-]*/gu;
 
 export function wordCount(text) {
   if (!text) return 0;
-  const m = text.match(WORD);
+  // Images and link targets aren't words.
+  const m = text.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ').replace(/\]\([^)]*\)/g, '] ').match(WORD);
   return m ? m.length : 0;
 }
 
@@ -58,7 +59,8 @@ export function noteTitle(text) {
 export function noteSnippet(text) {
   const lines = (text || '').split('\n');
   const first = lines.findIndex((l) => l.trim());
-  return lines.slice(first + 1).join(' ').replace(/\[[ xX]\]/g, '')
+  return lines.slice(first + 1).join(' ')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '').replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/\[[ xX]\]/g, '')
     .replace(/[#*_`>~\[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, 160);
 }
 
@@ -109,4 +111,90 @@ export function computeStreak(days, today, goal = DEFAULT_GOAL) {
     nextFreezeIn: freezes >= MAX_FREEZES ? null : FREEZE_EVERY - (run % FREEZE_EVERY),
     status,
   };
+}
+
+/* ---------- files ---------- */
+
+export const FILE_URL = /\/files\/([0-9a-f-]{36})(?:\/[^)\s]*)?/g;
+
+export function extractFileIds(text) {
+  return [...new Set([...(text || '').matchAll(FILE_URL)].map((m) => m[1]))].sort();
+}
+
+/* ---------- three-way merge (two devices editing the same text) ---------- */
+
+// Changed line ranges between a and b: [{ aStart, aEnd, bStart, bEnd }].
+export function diffLines(a, b) {
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre++;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf++;
+  const A = a.slice(pre, a.length - suf), B = b.slice(pre, b.length - suf);
+  const n = A.length, m = B.length;
+  if (!n && !m) return [];
+  if (!n || !m || n * m > 4e6) return [{ aStart: pre, aEnd: pre + n, bStart: pre, bEnd: pre + m }];
+  // LCS table, then walk it to emit change hunks.
+  const w = m + 1, L = new Uint32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      L[i * w + j] = A[i] === B[j] ? L[(i + 1) * w + j + 1] + 1 : Math.max(L[(i + 1) * w + j], L[i * w + j + 1]);
+    }
+  }
+  const hunks = [];
+  let i = 0, j = 0, open = null;
+  const close = () => { if (open) { open.aEnd = pre + i; open.bEnd = pre + j; hunks.push(open); open = null; } };
+  while (i < n || j < m) {
+    if (i < n && j < m && A[i] === B[j]) { close(); i++; j++; continue; }
+    if (!open) open = { aStart: pre + i, bStart: pre + j };
+    if (j < m && (i >= n || L[i * w + j + 1] >= L[(i + 1) * w + j])) j++; else i++;
+  }
+  close();
+  return hunks;
+}
+
+// Merges two edits of `base`. Where both sides changed the same lines differently,
+// keeps both (ours, then theirs) so nothing is lost, and counts a conflict.
+export function merge3(base, ours, theirs) {
+  if (ours === theirs || theirs === base) return { text: ours, conflicts: 0 };
+  if (ours === base) return { text: theirs, conflicts: 0 };
+  const O = base.split('\n'), X = ours.split('\n'), T = theirs.split('\n');
+  const hunks = [
+    ...diffLines(O, X).map((h) => ({ ...h, side: 'ours' })),
+    ...diffLines(O, T).map((h) => ({ ...h, side: 'theirs' })),
+  ].sort((p, q) => p.aStart - q.aStart || p.aEnd - q.aEnd);
+
+  // Hunks overlap when they share base lines, or when one is a pure insertion at the point the
+  // other touches (then the order is ambiguous). Edits to neighbouring lines stay separate.
+  const groups = [];
+  const isIns = (h) => h.aStart === h.aEnd;
+  for (const h of hunks) {
+    const g = groups[groups.length - 1];
+    const touches = g && h.aStart === g.hi && (isIns(h) || g.hunks.some((x) => isIns(x) && x.aStart === g.hi));
+    if (g && (h.aStart < g.hi || touches)) { g.hi = Math.max(g.hi, h.aEnd); g.hunks.push(h); }
+    else groups.push({ lo: h.aStart, hi: h.aEnd, hunks: [h] });
+  }
+  // Where base range [lo, hi) lands in one side, given that side's hunks.
+  // Line offset a side has accumulated before base line `lo` (hunks before a group all start before it).
+  const shift = (side, lo) => hunks.filter((h) => h.side === side && h.aStart < lo)
+    .reduce((d, h) => d + (h.bEnd - h.bStart) - (h.aEnd - h.aStart), 0);
+  const slice = (side, lines, g) => {
+    const d0 = shift(side, g.lo);
+    const d1 = d0 + g.hunks.filter((h) => h.side === side).reduce((d, h) => d + (h.bEnd - h.bStart) - (h.aEnd - h.aStart), 0);
+    return lines.slice(g.lo + d0, g.hi + d1);
+  };
+
+  const out = [];
+  let conflicts = 0, at = 0;
+  for (const g of groups) {
+    out.push(...O.slice(at, g.lo));
+    const sides = new Set(g.hunks.map((h) => h.side));
+    const mine = slice('ours', X, g), theirsPart = slice('theirs', T, g);
+    if (!sides.has('theirs')) out.push(...mine);
+    else if (!sides.has('ours')) out.push(...theirsPart);
+    else if (mine.join('\n') === theirsPart.join('\n')) out.push(...mine);
+    else { out.push(...mine, ...theirsPart); conflicts++; }
+    at = g.hi;
+  }
+  out.push(...O.slice(at));
+  return { text: out.join('\n'), conflicts };
 }

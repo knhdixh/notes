@@ -1,7 +1,7 @@
 // Markup editor (bundled to public/vendor/editor.js by `npm run vendor`).
 // Markdown stays visible but styled, as in Ulysses and Bear: muted markers, larger headings,
 // #tags, clickable checkboxes, plus focus mode and typewriter scrolling.
-import { EditorState, Compartment, RangeSetBuilder } from '@codemirror/state';
+import { EditorState, Compartment, RangeSetBuilder, StateField, Annotation, Transaction } from '@codemirror/state';
 import {
   EditorView, keymap, placeholder as placeholderExt, Decoration, ViewPlugin, WidgetType, MatchDecorator, drawSelection,
 } from '@codemirror/view';
@@ -41,7 +41,8 @@ const style = HighlightStyle.define([
   { tag: t.emphasis, class: 'md-em' },
   { tag: t.strikethrough, class: 'md-strike' },
   { tag: [t.processingInstruction, t.meta, t.contentSeparator], class: 'md-mark' },
-  { tag: [t.link, t.url], class: 'md-link' },
+  { tag: t.link, class: 'md-link' },
+  { tag: t.url, class: 'md-url' },
   { tag: t.monospace, class: 'md-code' },
   { tag: t.quote, class: 'md-quote' },
 ]);
@@ -115,6 +116,56 @@ const headingLines = ViewPlugin.fromClass(class {
   }
 }, { decorations: (v) => v.decorations });
 
+/* ---------- inline images: shown under their markdown line ---------- */
+class ImageWidget extends WidgetType {
+  constructor(src, alt) { super(); this.src = src; this.alt = alt; }
+  eq(o) { return o.src === this.src; }
+  toDOM() {
+    const wrap = document.createElement('div');
+    wrap.className = 'md-img';
+    const img = document.createElement('img');
+    img.src = this.src; img.alt = this.alt; img.loading = 'lazy'; img.draggable = false;
+    img.onerror = () => wrap.classList.add('broken');
+    wrap.appendChild(img);
+    return wrap;
+  }
+  get estimatedHeight() { return 240; }
+  ignoreEvent() { return false; }
+}
+const IMG = /!\[([^\]\n]*)\]\(((?:\/files\/|https:\/\/)[^)\s]+)\)/g;
+function imageDecos(state) {
+  const b = new RangeSetBuilder();
+  const text = state.doc.toString();
+  let lastLine = -1;
+  for (const m of text.matchAll(IMG)) {
+    if (m[2].startsWith('#')) continue;
+    const line = state.doc.lineAt(m.index);
+    if (line.number === lastLine) continue;
+    lastLine = line.number;
+    b.add(line.from, line.from, Decoration.line({ class: 'md-imgline' }));
+    b.add(line.to, line.to, Decoration.widget({ widget: new ImageWidget(m[2], m[1]), block: true, side: 1 }));
+  }
+  return b.finish();
+}
+// Block widgets have to come from a state field, not a view plugin.
+const imageField = StateField.define({
+  create: (state) => imageDecos(state),
+  update: (deco, tr) => (tr.docChanged ? imageDecos(tr.state) : deco),
+  provide: (f) => EditorView.decorations.from(f),
+});
+
+// Markdown link or image whose target covers `pos`.
+function linkAt(state, pos) {
+  const line = state.doc.lineAt(pos);
+  for (const m of line.text.matchAll(/!?\[[^\]\n]*\]\(([^)\s]+)\)/g)) {
+    const from = line.from + m.index;
+    if (pos >= from && pos <= from + m[0].length) return m[1];
+  }
+  return null;
+}
+
+const remote = Annotation.define();
+
 /* ---------- Bear-style title: the first line of a note ---------- */
 const titleLine = ViewPlugin.fromClass(class {
   constructor(view) { this.decorations = this.build(view); }
@@ -156,7 +207,7 @@ const typewriter = EditorView.updateListener.of((u) => {
   requestAnimationFrame(() => view.dispatch({ effects: EditorView.scrollIntoView(view.state.selection.main.head, { y: 'center' }) }));
 });
 
-export function createEditor({ parent, doc = '', placeholder = '', onChange, onTag, title = false }) {
+export function createEditor({ parent, doc = '', placeholder = '', onChange, onTag, onFiles, title = false }) {
   const focusC = new Compartment();
   const typeC = new Compartment();
   let opts = { focus: false, typewriter: false };
@@ -169,16 +220,38 @@ export function createEditor({ parent, doc = '', placeholder = '', onChange, onT
     syntaxHighlighting(style),
     EditorView.lineWrapping,
     placeholderExt(placeholder),
-    tagPlugin, checkPlugin, headingLines, title ? titleLine : [],
+    tagPlugin, checkPlugin, headingLines, imageField, title ? titleLine : [],
     focusC.of(opts.focus ? focusPlugin : []),
     typeC.of(opts.typewriter ? typewriter : []),
     EditorView.contentAttributes.of({ spellcheck: 'true', autocorrect: 'on', autocapitalize: 'sentences', 'aria-label': 'Editor' }),
-    EditorView.updateListener.of((u) => { if (u.docChanged && onChange) onChange(u.state.doc.toString()); }),
+    EditorView.updateListener.of((u) => {
+      if (u.docChanged && onChange && !u.transactions.every((tr) => tr.annotation(remote))) onChange(u.state.doc.toString());
+    }),
     EditorView.domEventHandlers({
-      click: (e) => {
+      click: (e, view) => {
+        if (!(e.metaKey || e.ctrlKey)) return false;
         const tag = e.target.closest && e.target.closest('.md-tag');
-        if (tag && onTag && (e.metaKey || e.ctrlKey)) { onTag(tag.dataset.tag); return true; }
+        if (tag && onTag) { onTag(tag.dataset.tag); return true; }
+        const img = e.target.closest && e.target.closest('.md-img img');
+        const pos = view.posAtCoords({ x: e.clientX, y: e.clientY });
+        const href = img ? img.getAttribute('src') : pos != null && linkAt(view.state, pos);
+        if (href && !href.startsWith('#')) { window.open(href, '_blank', 'noopener'); return true; }
         return false;
+      },
+      drop: (e, view) => {
+        const files = [...(e.dataTransfer?.files || [])];
+        if (!files.length || !onFiles) return false;
+        e.preventDefault();
+        const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }) ?? view.state.selection.main.head;
+        onFiles(files, pos);
+        return true;
+      },
+      paste: (e, view) => {
+        const files = [...(e.clipboardData?.files || [])];
+        if (!files.length || !onFiles) return false;
+        e.preventDefault();
+        onFiles(files, view.state.selection.main.head);
+        return true;
       },
     }),
   ];
@@ -193,6 +266,36 @@ export function createEditor({ parent, doc = '', placeholder = '', onChange, onT
       view.setState(EditorState.create({ doc: text, extensions: extensions(), selection: cursorEnd ? { anchor: text.length } : undefined }));
     },
     focus() { view.focus(); },
+    get cursor() { return view.state.selection.main.head; },
+    // Puts `text` on its own line(s) near `pos`.
+    insertBlock(pos, text) {
+      const line = view.state.doc.lineAt(Math.min(pos, view.state.doc.length));
+      let at, insert;
+      if (!line.text.trim()) { at = line.from; insert = text; }
+      else if (pos === line.from) { at = pos; insert = text + '\n'; }
+      else { at = line.to; insert = '\n' + text; }
+      view.dispatch({ changes: { from: at, insert }, selection: { anchor: at + insert.length }, scrollIntoView: true });
+    },
+    replaceText(search, replacement) {
+      const i = view.state.doc.toString().indexOf(search);
+      if (i < 0) return false;
+      view.dispatch({ changes: { from: i, to: i + search.length, insert: replacement } });
+      return true;
+    },
+    // Applies text that came from another device as a minimal change, keeping the cursor
+    // and not triggering onChange.
+    applyRemote(text) {
+      const cur = view.state.doc.toString();
+      if (cur === text) return;
+      let a = 0;
+      while (a < cur.length && a < text.length && cur[a] === text[a]) a++;
+      let z = 0;
+      while (z < cur.length - a && z < text.length - a && cur[cur.length - 1 - z] === text[text.length - 1 - z]) z++;
+      view.dispatch({
+        changes: { from: a, to: cur.length - z, insert: text.slice(a, text.length - z) },
+        annotations: [remote.of(true), Transaction.addToHistory.of(false)],
+      });
+    },
     setOptions(next) {
       opts = { ...opts, ...next };
       view.dispatch({ effects: [

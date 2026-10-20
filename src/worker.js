@@ -1,7 +1,8 @@
 // notes: Worker entry. /api/* is handled here; everything else is static (public/).
 import { verifyAccess } from './access.js';
+import { uploadFile, listFiles, renameFile, deleteFile, serveFile, FileError } from './files.js';
 import {
-  DEFAULT_GOAL, wordCount, localDay, validTimeZone, isDay, extractTags, noteTitle, noteSnippet, computeStreak,
+  DEFAULT_GOAL, wordCount, localDay, validTimeZone, isDay, extractTags, extractFileIds, noteTitle, noteSnippet, computeStreak,
 } from '../public/lib.js';
 
 class HttpError extends Error {
@@ -46,7 +47,7 @@ async function resolveTz(env, url, settings) {
 
 /* ---------- notes ---------- */
 
-const NOTE_COLS = 'id, title, snippet, words, pinned, created_at, updated_at, trashed_at';
+const NOTE_COLS = 'id, title, snippet, words, pinned, version, created_at, updated_at, trashed_at';
 
 async function withTags(env, notes) {
   if (!notes.length) return notes;
@@ -97,6 +98,13 @@ function tagStatements(env, id, tags) {
   ];
 }
 
+function refStatements(env, ref, body) {
+  return [
+    env.DB.prepare('DELETE FROM file_refs WHERE ref = ?').bind(ref),
+    env.DB.prepare('INSERT OR IGNORE INTO file_refs (ref, file_id) SELECT ?, value FROM json_each(?)').bind(ref, JSON.stringify(extractFileIds(body))),
+  ];
+}
+
 async function createNote(env, input) {
   const body = checkBody(input.body ?? '');
   const id = crypto.randomUUID();
@@ -106,22 +114,28 @@ async function createNote(env, input) {
     env.DB.prepare('INSERT INTO notes (id, body, title, snippet, words, pinned, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .bind(id, body, f.title, f.snippet, f.words, input.pinned ? 1 : 0, now, now),
     ...tagStatements(env, id, f.tags),
+    ...refStatements(env, 'note:' + id, body),
   ]);
   return getNote(env, id);
 }
 
 async function updateNote(env, id, input) {
-  const existing = await env.DB.prepare('SELECT id FROM notes WHERE id = ?').bind(id).first();
+  const existing = await env.DB.prepare('SELECT id, version FROM notes WHERE id = ?').bind(id).first();
   if (!existing) throw new HttpError(404, 'Note not found.');
   const now = Date.now();
   const stmts = [];
   if (input.body !== undefined) {
+    // Another device saved since this one last synced: hand back the current note to merge with.
+    if (input.base_version !== undefined && input.base_version !== existing.version) {
+      return { conflict: true, note: await getNote(env, id) };
+    }
     const body = checkBody(input.body);
     const f = noteFields(body);
     stmts.push(
-      env.DB.prepare('UPDATE notes SET body = ?, title = ?, snippet = ?, words = ?, updated_at = ? WHERE id = ?')
+      env.DB.prepare('UPDATE notes SET body = ?, title = ?, snippet = ?, words = ?, updated_at = ?, version = version + 1 WHERE id = ?')
         .bind(body, f.title, f.snippet, f.words, now, id),
       ...tagStatements(env, id, f.tags),
+      ...refStatements(env, 'note:' + id, body),
     );
   }
   if (input.pinned !== undefined) stmts.push(env.DB.prepare('UPDATE notes SET pinned = ? WHERE id = ?').bind(input.pinned ? 1 : 0, id));
@@ -150,26 +164,33 @@ async function diaryState(env, settings) {
 }
 
 async function getEntry(env, day) {
-  return (await env.DB.prepare('SELECT day, body, words, completed, completed_at, started_at, updated_at FROM entries WHERE day = ?').bind(day).first())
-    || { day, body: '', words: 0, completed: 0, completed_at: null, started_at: null, updated_at: null };
+  return (await env.DB.prepare('SELECT day, body, words, completed, completed_at, started_at, updated_at, version FROM entries WHERE day = ?').bind(day).first())
+    || { day, body: '', words: 0, completed: 0, completed_at: null, started_at: null, updated_at: null, version: 0 };
 }
 
 async function saveEntry(env, settings, day, input) {
   const body = checkBody(input.body);
   const today = localDay(Date.now(), settings.tz);
   if (day > today) throw new HttpError(400, 'That day has not started yet.');
+  if (input.base_version !== undefined) {
+    const current = await getEntry(env, day);
+    if (current.version !== input.base_version) return { conflict: true, entry: current };
+  }
   const words = wordCount(body);
   const now = Date.now();
   // A day is completed only if the goal is reached on that day; edits later don't count.
   const completesNow = day === today && words >= settings.goal ? 1 : 0;
-  await env.DB.prepare(
-    `INSERT INTO entries (day, body, words, completed, completed_at, started_at, updated_at)
-     VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 = 1 THEN ?5 END, ?5, ?5)
-     ON CONFLICT(day) DO UPDATE SET body = ?2, words = ?3, updated_at = ?5,
-       completed = MAX(completed, ?4),
-       completed_at = COALESCE(completed_at, CASE WHEN ?4 = 1 THEN ?5 END)`,
-  ).bind(day, body, words, completesNow, now).run();
-  return getEntry(env, day);
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO entries (day, body, words, completed, completed_at, started_at, updated_at)
+       VALUES (?1, ?2, ?3, ?4, CASE WHEN ?4 = 1 THEN ?5 END, ?5, ?5)
+       ON CONFLICT(day) DO UPDATE SET body = ?2, words = ?3, updated_at = ?5, version = version + 1,
+         completed = MAX(completed, ?4),
+         completed_at = COALESCE(completed_at, CASE WHEN ?4 = 1 THEN ?5 END)`,
+    ).bind(day, body, words, completesNow, now),
+    ...refStatements(env, 'day:' + day, body),
+  ]);
+  return { entry: await getEntry(env, day) };
 }
 
 /* ---------- router ---------- */
@@ -192,16 +213,25 @@ async function handleApi(request, env, url) {
   const nm = p.match(/^\/api\/notes\/([0-9a-f-]{36})$/);
   if (nm) {
     if (m === 'GET') return json(await getNote(env, nm[1]));
-    if (m === 'PUT') return json(await updateNote(env, nm[1], await readJson(request)));
+    if (m === 'PUT') {
+      const r = await updateNote(env, nm[1], await readJson(request));
+      return r.conflict ? json({ error: 'Changed on another device.', note: r.note }, { status: 409 }) : json(r);
+    }
     if (m === 'DELETE') {
       // Only notes already in the trash can be deleted for good.
-      const r = await env.DB.prepare('DELETE FROM notes WHERE id = ? AND trashed_at IS NOT NULL').bind(nm[1]).run();
+      const [r] = await env.DB.batch([
+        env.DB.prepare('DELETE FROM notes WHERE id = ? AND trashed_at IS NOT NULL').bind(nm[1]),
+        env.DB.prepare("DELETE FROM file_refs WHERE ref = 'note:' || ? AND NOT EXISTS (SELECT 1 FROM notes WHERE id = ?)").bind(nm[1], nm[1]),
+      ]);
       if (!r.meta.changes) throw new HttpError(404, 'Note not in trash.');
       return json({ ok: true });
     }
   }
   if (p === '/api/trash' && m === 'DELETE') {
-    await env.DB.prepare('DELETE FROM notes WHERE trashed_at IS NOT NULL').run();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM file_refs WHERE ref IN (SELECT 'note:' || id FROM notes WHERE trashed_at IS NOT NULL)"),
+      env.DB.prepare('DELETE FROM notes WHERE trashed_at IS NOT NULL'),
+    ]);
     return json({ ok: true });
   }
 
@@ -217,10 +247,17 @@ async function handleApi(request, env, url) {
     await resolveTz(env, url, settings);
     if (m === 'GET') return json(await getEntry(env, dm[1]));
     if (m === 'PUT') {
-      const entry = await saveEntry(env, settings, dm[1], await readJson(request));
-      return json({ entry, ...(await diaryState(env, settings)) });
+      const r = await saveEntry(env, settings, dm[1], await readJson(request));
+      if (r.conflict) return json({ error: 'Changed on another device.', entry: r.entry }, { status: 409 });
+      return json({ entry: r.entry, ...(await diaryState(env, settings)) });
     }
   }
+
+  if (p === '/api/files' && m === 'GET') return json(await listFiles(env));
+  if (p === '/api/files' && m === 'POST') return json(await uploadFile(env, request), { status: 201 });
+  const fm = p.match(/^\/api\/files\/([0-9a-f-]{36})$/);
+  if (fm && m === 'PUT') return json(await renameFile(env, fm[1], (await readJson(request)).name));
+  if (fm && m === 'DELETE') { await deleteFile(env, fm[1]); return json({ ok: true }); }
 
   if (p === '/api/settings' && m === 'PUT') {
     const input = await readJson(request);
@@ -255,6 +292,11 @@ export default {
         const origin = request.headers.get('Origin');
         if (origin && origin !== url.origin) throw new HttpError(403, 'Cross-origin request rejected.');
       }
+      const file = url.pathname.match(/^\/files\/([0-9a-f-]{36})(\/|$)/);
+      if (file && ['GET', 'HEAD'].includes(request.method)) {
+        if (!(await verifyAccess(request, env))) return new Response('Not signed in.', { status: 401 });
+        return await serveFile(env, file[1], request);
+      }
       if (url.pathname.startsWith('/api/')) {
         const res = await handleApi(request, env, url);
         res.headers.set('Cache-Control', 'no-store');
@@ -262,7 +304,7 @@ export default {
       }
       return env.ASSETS.fetch(request);
     } catch (e) {
-      if (e instanceof HttpError) return json({ error: e.message }, { status: e.status });
+      if (e instanceof HttpError || e instanceof FileError) return json({ error: e.message }, { status: e.status });
       console.error(e);
       return json({ error: 'Internal error.' }, { status: 500 });
     }

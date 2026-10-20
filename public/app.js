@@ -1,105 +1,16 @@
 import { createEditor } from '/vendor/editor.js';
 import { wordCount, localDay, addDays, DAY_CUTOFF_HOUR } from '/lib.js';
+import { $, api, esc, toast, store, n, plural, fmtDate, fmtDay, fuzzy } from '/ui.js';
+import { createSync } from '/sync.js';
+import { insertFiles, isImage } from '/uploads.js';
+import { files, loadFiles, renderFiles, bindFilesView, openViewer, closeViewer, uploadToLibrary } from '/files-view.js';
+import { createPalette } from '/palette.js';
 
-const $ = (id) => document.getElementById(id);
-const $toast = $('toast');
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 const reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const narrow = matchMedia('(max-width: 760px)');
-
-export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-
-export async function api(path, { method = 'GET', body, keepalive } = {}) {
-  let res;
-  try {
-    res = await fetch(path, {
-      method, keepalive,
-      headers: body ? { 'Content-Type': 'application/json' } : {},
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch {
-    // Offline, or the Access session expired (its login redirect is cross-origin).
-    throw new Error(navigator.onLine ? 'Connection lost. Text is kept on this device; reload to sign in again.' : 'Offline. Retrying.');
-  }
-  // Cloudflare Access session expired: it answers with a login redirect, not JSON.
-  if (res.redirected || res.status === 401) {
-    location.reload();
-    throw new Error('Signed out.');
-  }
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
-}
-
-let toastTimer;
-export function toast(msg, isError = false) {
-  $toast.textContent = msg;
-  $toast.className = 'toast' + (isError ? ' error' : '');
-  $toast.hidden = false;
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => ($toast.hidden = true), isError ? 6000 : 3000);
-}
-
-const store = {
-  get(k, d) { try { const v = localStorage.getItem('notes:' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem('notes:' + k, JSON.stringify(v)); } catch { /* private mode */ } },
-  del(k) { try { localStorage.removeItem('notes:' + k); } catch { /* ignore */ } },
-};
-
-/* ---------- autosave with retry and a local safety copy ---------- */
-// Each pending save remembers which note/day it belongs to, so a retry can never land on another one.
-function createSaver(ctx, save, onState) {
-  let timer, pending = null, inflight = false, retry, warned = false;
-  async function run() {
-    clearTimeout(timer);
-    if (inflight || pending == null) return;
-    const job = pending;
-    pending = null; inflight = true;
-    onState('saving');
-    try {
-      await save(job.text, job.key);
-      inflight = false; warned = false;
-      if (pending == null) { store.del('draft:' + job.key); onState('saved'); } else run();
-    } catch (e) {
-      inflight = false;
-      if (pending == null) pending = job;
-      onState('offline');
-      clearTimeout(retry);
-      retry = setTimeout(run, 5000);
-      if (!warned && !/Offline|Signed out/.test(e.message)) { warned = true; toast(e.message, true); }
-    }
-  }
-  return {
-    push(text) {
-      const key = ctx();
-      // A failed save for another note stays in its local draft and is restored when reopened.
-      pending = { text, key };
-      store.set('draft:' + key, text);
-      onState('edited');
-      clearTimeout(timer);
-      timer = setTimeout(run, 700);
-    },
-    flush: run,
-    get dirty() { return pending != null || inflight; },
-    beacon(url) {
-      if (pending == null) return;
-      fetch(url(pending.key), { method: 'PUT', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ body: pending.text }) });
-    },
-  };
-}
-const stateLabel = { saving: 'Saving', saved: 'Saved', edited: '', offline: 'Offline · kept locally' };
-
-/* ---------- formatting ---------- */
-const fmtDate = (ms) => {
-  const d = new Date(ms), now = new Date();
-  if (d.toDateString() === now.toDateString()) return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
-  const opts = { day: 'numeric', month: 'short' };
-  if (d.getFullYear() !== now.getFullYear()) opts.year = 'numeric';
-  return d.toLocaleDateString('en-GB', opts);
-};
-const fmtDay = (day) => new Date(day + 'T12:00:00Z').toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', timeZone: 'UTC' });
-const n = (x) => Number(x || 0).toLocaleString('en-GB');
-const plural = (x, w) => `${n(x)} ${w}${x === 1 ? '' : 's'}`;
+const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform);
+const MOD = IS_MAC ? '⌘' : 'Ctrl ';
 
 /* ---------- state ---------- */
 const S = {
@@ -107,52 +18,78 @@ const S = {
   diary: null, day: null, calMonth: null,
   opts: store.get('opts', { focus: false, typewriter: false }),
 };
+const stateLabel = { saving: 'Saving', saved: 'Saved', merged: 'Merged with another device', edited: '', offline: 'Offline · kept locally' };
 
 /* ---------- editors ---------- */
-const noteSaver = createSaver(() => S.noteId, async (body, id) => {
-  const saved = await api(`/api/notes/${id}`, { method: 'PUT', body: { body } });
-  const row = S.notes.find((x) => x.id === id);
-  if (row) { Object.assign(row, saved, { body: undefined }); renderRows(); }
-  if (S.note && S.note.id === id) S.note.tags = saved.tags;
-  if (saved.tags.join() !== (S.lastTags || '')) { S.lastTags = saved.tags.join(); loadTags(); }
-}, (st) => { $('note-status').textContent = stateLabel[st]; });
-
-const diarySaver = createSaver(() => 'day:' + S.day, async (body, key) => {
-  const day = key.slice(4);
-  const before = S.diary.stats;
-  const r = await api(`/api/diary/${day}?tz=${encodeURIComponent(TZ)}`, { method: 'PUT', body: { body } });
-  S.diary = { ...S.diary, today: r.today, days: r.days, stats: r.stats, entry: r.entry.day === r.today ? r.entry : S.diary.entry };
-  if (r.today === day && r.stats.todayDone && !before.todayDone) {
-    toast(`${n(r.stats.goal)} words. ${plural(r.stats.current, 'day')} in a row.`);
-  }
-  renderRail();
-}, (st) => { $('diary-status').textContent = stateLabel[st]; });
-
 const noteEd = createEditor({
   parent: $('note-editor'),
   placeholder: 'Start with a title…',
   title: true,
   onChange(text) {
     $('note-words').textContent = plural(wordCount(text), 'word');
-    noteSaver.push(text);
+    noteSync.push(text);
   },
   onTag: (tag) => go(`#/tag/${encodeURIComponent(tag)}`),
+  onFiles: (list, pos) => insertFiles(noteEd, list, pos).then(refreshFilesIfShown),
 });
 const diaryEd = createEditor({
   parent: $('diary-editor'),
   placeholder: 'Just write. Whatever is on your mind.',
-  onChange(text) { diarySaver.push(text); renderDiaryCount(wordCount(text)); },
+  onChange(text) { diarySync.push(text); renderDiaryCount(wordCount(text)); },
+  onFiles: (list, pos) => insertFiles(diaryEd, list, pos).then(refreshFilesIfShown),
 });
 for (const ed of [noteEd, diaryEd]) ed.setOptions(S.opts);
 
+/* ---------- sync (autosave + two-device merge) ---------- */
+const noteSync = createSync({
+  ctx: () => S.noteId,
+  url: (id) => `/api/notes/${id}`,
+  current: (id) => (S.noteId === id ? noteEd.getDoc() : null),
+  apply(id, text) {
+    if (S.noteId !== id) return;
+    noteEd.applyRemote(text);
+    $('note-words').textContent = plural(wordCount(text), 'word');
+  },
+  docOf: (r) => r.note || r,
+  onSaved(id, saved) {
+    const row = S.notes.find((x) => x.id === id);
+    if (row) { Object.assign(row, saved, { body: undefined }); renderRows(); }
+    if (S.note && S.note.id === id) S.note.tags = saved.tags;
+    if (saved.tags.join() !== (S.lastTags || '')) { S.lastTags = saved.tags.join(); loadTags(); }
+  },
+  onState: (st) => { $('note-status').textContent = stateLabel[st]; },
+});
+
+const diarySync = createSync({
+  ctx: () => (S.day ? 'day:' + S.day : null),
+  url: (key) => `/api/diary/${key.slice(4)}?tz=${encodeURIComponent(TZ)}`,
+  current: (key) => (S.day && 'day:' + S.day === key ? diaryEd.getDoc() : null),
+  apply(key, text) {
+    if ('day:' + S.day !== key) return;
+    diaryEd.applyRemote(text);
+    renderDiaryCount(wordCount(text));
+  },
+  docOf: (r) => r.entry,
+  onSaved(key, r) {
+    const before = S.diary.stats;
+    S.diary = { ...S.diary, today: r.today, days: r.days, stats: r.stats };
+    if (r.today === key.slice(4) && r.stats.todayDone && !before.todayDone) {
+      toast(`${n(r.stats.goal)} words. ${plural(r.stats.current, 'day')} in a row.`);
+    }
+    renderRail();
+  },
+  onState: (st) => { $('diary-status').textContent = stateLabel[st]; },
+});
+
 /* ---------- routing ---------- */
-// #/today · #/day/2026-10-01 · #/notes[/id] · #/tag/<tag>[/id] · #/trash[/id]
+// #/today · #/day/2026-10-01 · #/notes[/id] · #/tag/<tag>[/id] · #/trash[/id] · #/files
 function parseHash() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
   switch (parts[0]) {
     case 'day': return { view: 'diary', day: parts[1] };
     case 'notes': return { view: 'notes', id: parts[1] };
     case 'trash': return { view: 'trash', id: parts[1] };
+    case 'files': return { view: 'files' };
     case 'tag': {
       const last = parts[parts.length - 1];
       const isId = /^[0-9a-f-]{36}$/.test(last);
@@ -163,18 +100,24 @@ function parseHash() {
   }
 }
 const go = (hash) => { if (location.hash !== hash) location.hash = hash; else route(); };
-const listHash = () => (S.view === 'tag' ? `#/tag/${S.tag.split('/').map(encodeURIComponent).join('/')}` : `#/${S.view}`);
+const listHash = () => (S.view === 'tag' ? `#/tag/${S.tag.split('/').map(encodeURIComponent).join('/')}` : S.view === 'trash' ? '#/trash' : '#/notes');
 
 async function route() {
   const r = parseHash();
   if (r.view === 'menu') { setScreen('nav'); return; }
   await leaveNote();
-  if (r.view === 'diary') {
-    S.view = 'diary';
-    document.body.dataset.view = 'diary';
-    setScreen('diary');
+  if (r.view === 'diary' || r.view === 'files') {
+    S.view = r.view;
+    document.body.dataset.view = r.view;
+    setScreen(r.view);
     markNav();
-    await openDay(r.day);
+    if (r.view === 'diary') await openDay(r.day);
+    else {
+      if (S.day) await diarySync.flush();
+      renderFiles();
+      await loadFiles();
+      renderFiles();
+    }
     return;
   }
   const listChanged = S.view !== r.view || S.tag !== (r.tag || null) || !S.listLoaded;
@@ -198,7 +141,9 @@ function markNav() {
   document.querySelectorAll('.nav-row').forEach((b) => b.classList.toggle('on', b.dataset.view === S.view));
   document.querySelectorAll('.tag-row').forEach((b) => b.classList.toggle('on', S.view === 'tag' && b.dataset.tag === S.tag));
   $('diary-pane').hidden = S.view !== 'diary';
-  $('empty-pane').hidden = S.view === 'diary' || !!S.noteId;
+  $('files-pane').hidden = S.view !== 'files';
+  $('note-pane').hidden = S.view === 'diary' || S.view === 'files' || !S.noteId;
+  $('empty-pane').hidden = S.view === 'diary' || S.view === 'files' || !!S.noteId;
 }
 
 /* ---------- notes ---------- */
@@ -241,27 +186,27 @@ async function loadTags() {
     for (let i = 1; i < parts.length; i++) { const p = parts.slice(0, i).join('/'); if (!all.has(p)) all.set(p, 0); }
     all.set(t.tag, t.count);
   }
-  const list = [...all.keys()].sort();
-  $('tag-count').textContent = list.length ? String(list.length).padStart(2, '0') : '';
-  $('tags').innerHTML = list.length ? list.map((tag) => {
+  S.tagList = [...all.keys()].sort();
+  $('tag-count').textContent = S.tagList.length ? String(S.tagList.length).padStart(2, '0') : '';
+  $('tags').innerHTML = S.tagList.length ? S.tagList.map((tag) => {
     const parts = tag.split('/');
-    return `<li><a class="tag-row${S.view === 'tag' && S.tag === tag ? ' on' : ''}" data-tag="${esc(tag)}" style="--depth:${parts.length - 1}" href="#/tag/${parts.map(encodeURIComponent).join('/')}">
+    return `<li><a class="tag-row${S.view === 'tag' && S.tag === tag ? ' on' : ''}" data-tag="${esc(tag)}" style="--depth:${parts.length - 1}" href="${tagHash(tag)}">
       <span class="tag-name">${esc(parts[parts.length - 1])}</span><span class="nav-n">${all.get(tag) || ''}</span></a></li>`;
   }).join('') : '<li class="muted" style="font-size:13px">Type #tag in a note.</li>';
 }
+const tagHash = (tag) => `#/tag/${tag.split('/').map(encodeURIComponent).join('/')}`;
 
 async function openNote(id) {
   if (S.noteId === id && S.note) return;
   const note = await api(`/api/notes/${id}`).catch((e) => { toast(e.message, true); return null; });
   if (!note) { go(listHash()); return; }
   S.noteId = id; S.note = note; S.lastTags = note.tags.join();
-  const draft = store.get('draft:' + id, null);
-  const body = draft != null && draft !== note.body ? draft : note.body;
-  noteEd.setDoc(body);
-  if (draft != null && draft !== note.body) noteSaver.push(draft);
+  const { text, dirty } = noteSync.open(id, note);
+  noteEd.setDoc(text);
+  if (dirty) noteSync.push(text);
   $('note-pane').hidden = false;
   $('empty-pane').hidden = true;
-  $('note-words').textContent = plural(wordCount(body), 'word');
+  $('note-words').textContent = plural(wordCount(text), 'word');
   $('note-status').textContent = '';
   const trashed = !!note.trashed_at;
   $('trash-banner').hidden = !trashed;
@@ -269,16 +214,16 @@ async function openNote(id) {
   $('pin').textContent = note.pinned ? 'unpin' : 'pin';
   noteEd.view.contentDOM.contentEditable = String(!trashed);
   renderRows();
-  if (!narrow.matches || !body) noteEd.focus();
+  if (!narrow.matches || !text) noteEd.focus();
 }
 
 // Leaving a note: save it, and drop it if it was never written in.
 async function leaveNote() {
   if (!S.noteId) return;
-  await noteSaver.flush();
+  await noteSync.flush();
   const id = S.noteId;
   const text = noteEd.getDoc();
-  if (!text.replace(/#[\p{L}\p{N}_/-]+/gu, '').trim() && S.note && !S.note.trashed_at) {
+  if (!text.replace(/#[\p{L}\p{N}_/-]+/gu, '').trim() && S.note && !S.note.trashed_at && !noteSync.dirty) {
     await api(`/api/notes/${id}`, { method: 'PUT', body: { trashed: true } }).catch(() => {});
     await api(`/api/notes/${id}`, { method: 'DELETE' }).catch(() => {});
     S.notes = S.notes.filter((x) => x.id !== id);
@@ -288,7 +233,7 @@ async function leaveNote() {
 }
 
 async function newNote() {
-  if (S.view === 'trash' || S.view === 'diary') { S.view = 'notes'; S.tag = null; }
+  if (!['notes', 'tag'].includes(S.view)) { S.view = 'notes'; S.tag = null; S.listLoaded = false; }
   const body = S.view === 'tag' ? `\n\n#${S.tag}` : '';
   const note = await api('/api/notes', { method: 'POST', body: { body } });
   if (S.q) { S.q = ''; $('search').value = ''; }
@@ -301,26 +246,25 @@ async function newNote() {
 async function loadDiary() {
   const d = await api(`/api/diary?tz=${encodeURIComponent(TZ)}`);
   S.diary = d;
+  S.diaryAt = Date.now();
   if (!S.calMonth) S.calMonth = d.today.slice(0, 7);
   return d;
 }
 
 async function openDay(day) {
-  if (diarySaver.dirty) await diarySaver.flush();
+  if (diarySync.dirty) await diarySync.flush();
   const d = S.diary && Date.now() - (S.diaryAt || 0) < 30e3 ? S.diary : await loadDiary();
-  S.diaryAt = Date.now();
   const target = day && day <= d.today ? day : d.today;
+  const entry = await api(`/api/diary/${target}`);
   const changed = S.day !== target;
   S.day = target;
-  const entry = target === d.today && d.entry && d.entry.day === target ? d.entry : await api(`/api/diary/${target}`);
-  const draft = store.get('draft:day:' + target, null);
-  const body = draft != null && draft !== entry.body ? draft : entry.body;
-  if (changed || diaryEd.getDoc() !== body) diaryEd.setDoc(body, { cursorEnd: true });
-  if (draft != null && draft !== entry.body) diarySaver.push(draft);
+  const { text, dirty } = diarySync.open('day:' + target, entry);
+  if (changed || diaryEd.getDoc() !== text) diaryEd.setDoc(text, { cursorEnd: true });
+  if (dirty) diarySync.push(text);
   if (changed) renderTitle(target);
   $('past-note').hidden = target === d.today;
   $('diary-status').textContent = '';
-  renderDiaryCount(wordCount(body));
+  renderDiaryCount(wordCount(text));
   renderRail();
   if (!narrow.matches) diaryEd.focus();
 }
@@ -349,7 +293,6 @@ function hoursLeft() {
 function renderRail() {
   const { stats, today } = S.diary;
   $('streak').textContent = n(stats.current);
-  $('streak-label').textContent = stats.current === 1 ? 'day streak' : 'day streak';
   $('nav-streak').textContent = stats.current ? n(stats.current) + (stats.todayDone ? '' : ' ·') : '';
   $('nav-streak').title = stats.todayDone ? 'Done today' : 'Not done today';
   let hint;
@@ -415,6 +358,114 @@ function toggle(k) {
   applyToggles();
 }
 
+/* ---------- files ---------- */
+const activeEditor = () => (S.view === 'diary' && S.day ? diaryEd : S.noteId && !S.note?.trashed_at && S.view !== 'files' ? noteEd : null);
+
+function refreshFilesIfShown() {
+  if (S.view === 'files') loadFiles().then(renderFiles);
+  else files.loaded = false;
+}
+
+// Upload from the picker or a drop outside an editor: into the open note/day, else the library.
+function addFiles(list) {
+  const arr = [...list];
+  if (!arr.length) return;
+  const ed = activeEditor();
+  if (ed) insertFiles(ed, arr, ed.cursor).then(refreshFilesIfShown);
+  else uploadToLibrary(arr);
+}
+
+function pickFiles() { $('file-input').click(); }
+$('file-input').addEventListener('change', (e) => { addFiles(e.target.files); e.target.value = ''; });
+
+// Drop anywhere on the page.
+let dragDepth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types || [])].includes('Files');
+addEventListener('dragenter', (e) => { if (hasFiles(e)) { dragDepth++; $('drop').hidden = false; } });
+addEventListener('dragleave', (e) => { if (hasFiles(e) && --dragDepth <= 0) { dragDepth = 0; $('drop').hidden = true; } });
+addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+addEventListener('drop', (e) => {
+  dragDepth = 0; $('drop').hidden = true;
+  // Drops onto the text itself are placed at the drop point by the editor.
+  if (!hasFiles(e) || e.target.closest?.('.cm-editor')) return;
+  e.preventDefault();
+  addFiles(e.dataTransfer.files);
+});
+
+/* ---------- command palette (⌘/) ---------- */
+let allNotes = null, allNotesAt = 0;
+async function notesIndex() {
+  if (!allNotes || Date.now() - allNotesAt > 20e3) {
+    allNotes = await api('/api/notes');
+    allNotesAt = Date.now();
+  }
+  return allNotes;
+}
+
+function commands() {
+  const noteOpen = S.noteId && S.note && S.view !== 'diary' && S.view !== 'files';
+  const editing = !!activeEditor();
+  return [
+    { label: 'New note', hint: `${MOD}⌥N`, run: () => newNote() },
+    { label: 'Go to today', hint: `${MOD}J`, run: () => go('#/today') },
+    { label: 'Go to notes', run: () => go('#/notes') },
+    { label: 'Go to files', run: () => go('#/files') },
+    { label: 'Go to trash', run: () => go('#/trash') },
+    { label: "Yesterday's entry", run: () => go(`#/day/${addDays(S.diary?.today || localDay(Date.now(), TZ), -1)}`) },
+    { label: 'Search notes', hint: `${MOD}K`, run: () => focusSearch() },
+    { label: editing ? 'Insert image or file' : 'Upload files', run: pickFiles },
+    { label: `${S.opts.focus ? 'Turn off' : 'Turn on'} focus mode`, run: () => toggle('focus') },
+    { label: `${S.opts.typewriter ? 'Turn off' : 'Turn on'} typewriter mode`, run: () => toggle('typewriter') },
+    { label: document.body.classList.contains('full') ? 'Exit full screen' : 'Full screen', hint: `${MOD}.`, run: () => toggle('full') },
+    noteOpen && !S.note.trashed_at && { label: S.note.pinned ? 'Unpin note' : 'Pin note', run: () => $('pin').click() },
+    noteOpen && !S.note.trashed_at && { label: 'Move note to trash', run: () => $('trash-note').click() },
+    noteOpen && S.note.trashed_at && { label: 'Restore note', run: () => $('restore').click() },
+    { label: 'Set daily goal', run: async () => { if (S.view !== 'diary') await new Promise((r) => { go('#/today'); setTimeout(r, 300); }); $('goal').click(); } },
+    { label: 'Export everything', run: () => { location.href = '/api/export'; } },
+  ].filter(Boolean);
+}
+
+const palette = createPalette(async (query) => {
+  const q = query.trim();
+  const rank = (arr, text, limit) => arr.map((x) => ({ x, s: fuzzy(q, text(x)) })).filter((r) => r.s >= 0)
+    .sort((a, b) => b.s - a.s).slice(0, limit).map((r) => r.x);
+
+  // "#tag" narrows to tags, like Todoist's filters.
+  if (q.startsWith('#')) {
+    const tq = q.slice(1);
+    return [{ title: 'Tags', items: (S.tagList || []).map((t) => ({ t, s: fuzzy(tq, t) })).filter((r) => r.s >= 0).sort((a, b) => b.s - a.s).slice(0, 12)
+      .map(({ t }) => ({ label: '#' + t, run: () => go(tagHash(t)) })) }];
+  }
+
+  const notes = await notesIndex().catch(() => []);
+  if (!q) {
+    return [
+      { title: 'Recent notes', items: notes.slice(0, 5).map((x) => ({ label: x.title || 'Untitled', meta: fmtDate(x.updated_at), run: () => go(`#/notes/${x.id}`) })) },
+      { title: 'Commands', items: commands() },
+    ];
+  }
+
+  let noteHits = rank(notes, (x) => x.title || 'Untitled', 6);
+  // Words inside notes, not only titles.
+  if (q.length >= 3 && noteHits.length < 6) {
+    const body = await api('/api/notes?q=' + encodeURIComponent(q)).catch(() => []);
+    for (const x of body) if (noteHits.length < 8 && !noteHits.some((h) => h.id === x.id)) noteHits.push(x);
+  }
+  if (!files.loaded) await loadFiles().catch(() => {});
+  return [
+    { title: 'Commands', items: rank(commands(), (c) => c.label, 6) },
+    { title: 'Notes', items: noteHits.map((x) => ({ label: x.title || 'Untitled', meta: fmtDate(x.updated_at), run: () => go(`#/notes/${x.id}`) })) },
+    { title: 'Tags', items: rank(S.tagList || [], (t) => t, 4).map((t) => ({ label: '#' + t, run: () => go(tagHash(t)) })) },
+    { title: 'Files', items: rank(files.list, (f) => f.name, 4).map((f) => ({ label: f.name, meta: isImage(f.type) ? 'image' : 'file', run: () => openViewer(f) })) },
+    { title: 'Diary', items: rank(S.diary?.days || [], (d) => `${fmtDay(d.day)} ${d.day}`, 3).map((d) => ({ label: fmtDay(d.day), meta: plural(d.words, 'word'), run: () => go(`#/day/${d.day}`) })) },
+  ];
+});
+
+function focusSearch() {
+  if (!['notes', 'tag', 'trash'].includes(S.view)) go('#/notes');
+  setTimeout(() => $('search').focus(), 60);
+}
+
 /* ---------- events ---------- */
 document.addEventListener('click', (e) => {
   const t = e.target.closest('[data-toggle],[data-back],[data-view]');
@@ -428,6 +479,10 @@ $('new-note').addEventListener('click', () => newNote().catch((e) => toast(e.mes
 $('back-today').addEventListener('click', () => go('#/today'));
 $('cal-prev').addEventListener('click', () => shiftMonth(-1));
 $('cal-next').addEventListener('click', () => shiftMonth(1));
+$('upload').addEventListener('click', pickFiles);
+$('open-palette').addEventListener('click', () => palette.open());
+$('open-palette').textContent = `Commands ${MOD}/`;
+bindFilesView();
 
 let searchTimer;
 $('search').addEventListener('input', (e) => {
@@ -442,19 +497,20 @@ $('pin').addEventListener('click', async () => {
   await loadNotes();
 });
 $('trash-note').addEventListener('click', async () => {
-  await noteSaver.flush();
+  await noteSync.flush();
   const id = S.noteId;
   await api(`/api/notes/${id}`, { method: 'PUT', body: { trashed: true } });
   S.note = null; S.noteId = null;
   toast('Moved to trash.');
   S.notes = S.notes.filter((x) => x.id !== id);
+  allNotes = null;
   go(listHash());
   loadTags();
 });
 $('restore').addEventListener('click', async () => {
   const id = S.noteId;
   await api(`/api/notes/${id}`, { method: 'PUT', body: { trashed: false } });
-  S.note = null; S.noteId = null;
+  S.note = null; S.noteId = null; S.listLoaded = false; allNotes = null;
   toast('Restored.');
   go(`#/notes/${id}`);
   loadTags();
@@ -484,7 +540,6 @@ $('goal').addEventListener('click', () => {
     if (!save || v === S.diary.stats.goal) return;
     try {
       await api('/api/settings', { method: 'PUT', body: { goal: v } });
-      S.diaryAt = 0;
       await loadDiary();
       renderRail();
       renderDiaryCount(wordCount(diaryEd.getDoc()));
@@ -495,28 +550,50 @@ $('goal').addEventListener('click', () => {
   input.addEventListener('blur', () => done(!input.dataset.cancel), { once: true });
 });
 
-document.addEventListener('keydown', (e) => {
+// Capture phase, so ⌘/ wins over the editor's own bindings.
+addEventListener('keydown', (e) => {
   const mod = e.metaKey || e.ctrlKey;
+  if (mod && (e.key === '/' || e.code === 'Slash')) { e.preventDefault(); e.stopPropagation(); palette.toggle(); return; }
+  if (palette.isOpen) return;
+  if (e.key === 'Escape' && !$('viewer').hidden) { closeViewer(); return; }
   if (mod && e.key === '.') { e.preventDefault(); toggle('full'); }
   else if (e.key === 'Escape' && document.body.classList.contains('full')) toggle('full');
-  else if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); if (S.view === 'diary') go('#/notes'); setTimeout(() => $('search').focus(), 50); }
+  else if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); focusSearch(); }
   else if (mod && e.altKey && e.code === 'KeyN') { e.preventDefault(); newNote(); }
   else if (mod && e.key.toLowerCase() === 'j') { e.preventDefault(); go('#/today'); }
-});
+}, true);
 
 addEventListener('hashchange', () => route().catch((e) => toast(e.message, true)));
-addEventListener('pagehide', () => {
-  noteSaver.beacon((id) => `/api/notes/${id}`);
-  diarySaver.beacon((key) => `/api/diary/${key.slice(4)}?tz=${encodeURIComponent(TZ)}`);
-});
+addEventListener('pagehide', () => { noteSync.beacon(); diarySync.beacon(); });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { noteSaver.flush(); diarySaver.flush(); }
-  else checkRollover();
+  if (document.visibilityState === 'hidden') { noteSync.flush(); diarySync.flush(); }
+  else { checkRollover(); pullRemote(); }
 });
+addEventListener('focus', () => pullRemote());
+
+// Bring in edits made on another device while this one sits idle on the same note or day.
+async function pullRemote() {
+  if (document.visibilityState !== 'visible') return;
+  try {
+    if (S.noteId && S.view !== 'diary' && S.view !== 'files') {
+      const id = S.noteId;
+      if (await noteSync.pull(id, () => api(`/api/notes/${id}`))) $('note-status').textContent = 'Updated from another device';
+    } else if (S.view === 'diary' && S.day) {
+      const day = S.day;
+      if (await diarySync.pull('day:' + day, () => api(`/api/diary/${day}`))) {
+        $('diary-status').textContent = 'Updated from another device';
+        S.diaryAt = 0;
+        await loadDiary();
+        renderRail();
+      }
+    }
+  } catch { /* offline; try again later */ }
+}
+setInterval(pullRemote, 15e3);
 
 // The diary day changes at 3 a.m.; move to the new page if nothing is pending.
 function checkRollover() {
-  if (!S.diary || S.view !== 'diary' || diarySaver.dirty) return;
+  if (!S.diary || S.view !== 'diary' || diarySync.dirty) return;
   if (localDay(Date.now(), TZ) !== S.diary.today && S.day === S.diary.today) {
     S.diaryAt = 0; S.day = null; S.diary = null; S.calMonth = null;
     route();

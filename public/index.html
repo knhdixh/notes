@@ -21,11 +21,13 @@
       <nav class="nav" id="nav">
         <button class="nav-row" data-view="diary"><span>today</span><span class="nav-n" id="nav-streak"></span></button>
         <button class="nav-row" data-view="notes"><span>notes</span><span class="nav-n" id="nav-count"></span></button>
+        <button class="nav-row" data-view="files"><span>files</span><span class="nav-n"></span></button>
         <button class="nav-row" data-view="trash"><span>trash</span><span class="nav-n"></span></button>
       </nav>
       <div class="meta side-meta"><span>Tags</span><span id="tag-count"></span></div>
       <ul class="tags" id="tags"></ul>
       <div class="side-foot">
+        <button class="link" id="open-palette">Commands ⌘/</button>
         <a href="/api/export" class="link" download>Export</a>
         <span class="muted" id="me"></span>
       </div>
@@ -66,6 +68,28 @@
         <button class="link danger" id="purge">Delete forever</button>
       </div>
       <div class="editor-wrap"><div class="editor" id="note-editor"></div></div>
+    </section>
+
+    <!-- files -->
+    <section class="pane files" id="files-pane" hidden>
+      <div class="bar">
+        <button class="back" data-back="nav" aria-label="Back">←</button>
+        <span class="bar-gap"></span>
+        <button class="tool" id="upload">upload</button>
+      </div>
+      <div class="files-body">
+        <h1 class="page-title">files</h1>
+        <div class="files-tools">
+          <label class="search files-search"><span class="sr">Search files</span><input id="files-search" type="search" placeholder="Search files" autocomplete="off" spellcheck="false"></label>
+          <div class="filters" role="group" aria-label="Filter">
+            <button class="tool on" data-ffilter="all">all</button>
+            <button class="tool" data-ffilter="images">images</button>
+            <button class="tool" data-ffilter="other">other</button>
+          </div>
+        </div>
+        <div class="meta"><span>Library</span><span id="files-n"></span></div>
+        <ul class="file-rows" id="file-rows"></ul>
+      </div>
     </section>
 
     <section class="pane" id="empty-pane" hidden><p class="pane-empty">No note selected.</p></section>
@@ -111,6 +135,22 @@
       </div>
     </section>
   </div>
+  <input type="file" id="file-input" multiple hidden>
+  <div class="drop" id="drop" hidden><span>Drop to add</span></div>
+
+  <div class="viewer" id="viewer" hidden role="dialog" aria-label="Image">
+    <img id="viewer-img" alt="">
+    <div class="viewer-bar"><span id="viewer-name"></span><span class="bar-gap"></span><a class="link" id="viewer-open" target="_blank" rel="noopener">Open ↗</a><button class="link" id="viewer-close">Close</button></div>
+  </div>
+
+  <div class="palette" id="palette" hidden>
+    <div class="pal-box" role="dialog" aria-label="Commands">
+      <input id="pal-input" placeholder="Type a command or search" autocomplete="off" spellcheck="false" role="combobox" aria-controls="pal-list" aria-expanded="true">
+      <ul id="pal-list" role="listbox"></ul>
+      <div class="pal-foot"><span>↑↓ move</span><span>↵ select</span><span># tags</span><span>esc close</span></div>
+    </div>
+  </div>
+
   <div id="toast" class="toast" hidden></div>
   <script type="module" src="/app.js"></script>
 </body>

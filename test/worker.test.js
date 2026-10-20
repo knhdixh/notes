@@ -135,3 +135,75 @@ test('verifyAccess accepts only a valid token for the owner', async () => {
   assert.equal(await verifyAccess(req(t.slice(0, -4) + 'AAAA'), e, fetcher), null, 'tampered signature');
   assert.equal(await verifyAccess(req(await sign(good)), { ...e, OWNER_EMAIL: '' }, fetcher), null, 'no owner configured');
 });
+
+/* ---------- files ---------- */
+
+const upload = (bytes, name, type) => worker.fetch(new Request('https://app.test/api/files', {
+  method: 'POST', body: bytes, headers: { 'Content-Type': type, 'X-File-Name': encodeURIComponent(name), 'Content-Length': String(bytes.length) },
+}), env);
+
+test('files: upload in chunks, serve, list with refs, rename, delete', async () => {
+  const big = new Uint8Array(2.5 * 1024 * 1024).map((_, i) => i % 251);
+  const res = await upload(big, 'photo ä.jpg', 'image/jpeg');
+  assert.equal(res.status, 201);
+  const f = await res.json();
+  assert.equal(f.size, big.length);
+  assert.match(f.url, /^\/files\/[0-9a-f-]{36}\/photo%20%C3%A4\.jpg$/);
+
+  const got = await worker.fetch(new Request('https://app.test' + f.url), env);
+  assert.equal(got.status, 200);
+  assert.equal(got.headers.get('content-type'), 'image/jpeg');
+  assert.match(got.headers.get('content-disposition'), /^inline/);
+  assert.match(got.headers.get('content-security-policy'), /sandbox/);
+  assert.deepEqual(new Uint8Array(await got.arrayBuffer()), big);
+
+  const note = (await call('/api/notes', { method: 'POST', body: { body: `Trip\n![photo](${f.url})` } })).data;
+  await call(`/api/diary/${localDay(Date.now(), 'UTC')}?tz=UTC`, { method: 'PUT', body: { body: `![p](${f.url})` } });
+  let list = (await call('/api/files')).data;
+  assert.equal(list.length, 1);
+  assert.deepEqual(list[0].usedIn.map((u) => [u.kind, u.title]).sort(), [['day', localDay(Date.now(), 'UTC')], ['note', 'Trip']]);
+
+  // Removing the reference from the note updates usage.
+  await call(`/api/notes/${note.id}`, { method: 'PUT', body: { body: 'Trip' } });
+  list = (await call('/api/files')).data;
+  assert.deepEqual(list[0].usedIn.map((u) => u.kind), ['day']);
+
+  assert.equal((await call(`/api/files/${f.id}`, { method: 'PUT', body: { name: 'beach.jpg' } })).data.name, 'beach.jpg');
+  assert.equal((await call(`/api/files/${f.id}`, { method: 'DELETE' })).status, 200);
+  assert.equal((await worker.fetch(new Request('https://app.test' + f.url), env)).status, 404);
+  assert.equal(env.DB.raw.prepare('SELECT COUNT(*) AS n FROM file_chunks').get().n, 0);
+});
+
+test('files: risky types download, oversize rejected, serving needs Access', async () => {
+  const f = await (await upload(new TextEncoder().encode('<svg onload=alert(1)>'), 'x.svg', 'image/svg+xml')).json();
+  const got = await worker.fetch(new Request('https://app.test' + f.url), env);
+  assert.match(got.headers.get('content-disposition'), /^attachment/);
+  assert.equal((await upload(new Uint8Array(11 * 1024 * 1024), 'big.bin', 'application/octet-stream')).status, 413);
+  env.DEV_LOGIN = undefined;
+  assert.equal((await worker.fetch(new Request('https://app.test' + f.url), env)).status, 401);
+});
+
+/* ---------- two devices ---------- */
+
+test('note save with a stale base_version returns 409 with the current note', async () => {
+  const n = (await call('/api/notes', { method: 'POST', body: { body: 'v1' } })).data;
+  assert.equal(n.version, 1);
+  const a = (await call(`/api/notes/${n.id}`, { method: 'PUT', body: { body: 'from A', base_version: 1 } })).data;
+  assert.equal(a.version, 2);
+  const b = await call(`/api/notes/${n.id}`, { method: 'PUT', body: { body: 'from B', base_version: 1 } });
+  assert.equal(b.status, 409);
+  assert.equal(b.data.note.body, 'from A');
+  assert.equal(b.data.note.version, 2);
+  // Pinning doesn't need a version.
+  assert.equal((await call(`/api/notes/${n.id}`, { method: 'PUT', body: { pinned: true } })).status, 200);
+});
+
+test('diary save with a stale base_version returns 409', async () => {
+  const day = localDay(Date.now(), 'UTC');
+  const first = (await call(`/api/diary/${day}?tz=UTC`, { method: 'PUT', body: { body: 'a', base_version: 0 } })).data;
+  assert.equal(first.entry.version, 1);
+  assert.equal((await call(`/api/diary/${day}?tz=UTC`, { method: 'PUT', body: { body: 'b', base_version: 1 } })).data.entry.version, 2);
+  const stale = await call(`/api/diary/${day}?tz=UTC`, { method: 'PUT', body: { body: 'c', base_version: 1 } });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.data.entry.body, 'b');
+});

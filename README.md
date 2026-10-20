@@ -18,16 +18,21 @@ A private writing space: Bear-style markdown notes with tags, plus a daily 750-w
 | **Tags** | `#tag` and `#nested/tag` anywhere in a note, with a tag tree in the sidebar. ⌘-click a tag to filter |
 | **Checklists** | `- [ ]` renders a clickable box. Enter continues lists, checklists and quotes |
 | **Writing modes** | Focus (dims all but the current paragraph), typewriter (caret stays centred), full screen (⌘.) |
-| **Safe saving** | Autosaves 0.7 s after you stop typing, keeps a local copy until the server confirms, retries when offline |
+| **Images & files** | Drag or paste into any note or diary entry. Images show inline (big photos are scaled to 2400 px in the browser first), other files become links. Up to 10 MB each |
+| **Files** | A simple file browser: thumbnails, search, images/other filter, where each file is used, preview, copy as markdown, rename, delete |
+| **Command palette** | ⌘/ opens a Todoist-style command menu: every command, notes (titles and full text), tags (`#` to filter to tags), files and diary days, all from the keyboard |
+| **Two devices** | Every save carries the version it was based on. If another device saved in between, the edits are merged line by line (three-way merge), so both survive. An idle open note picks up edits from the other device on its own |
+| **Safe saving** | Autosaves 0.7 s after you stop typing, keeps a local copy (with its base version) until the server confirms, retries when offline, and merges an old local copy instead of overwriting newer edits |
 | **Library** | Search, pin, trash with restore, JSON export |
 
-Shortcuts: ⌘K search · ⌘J today · ⌘⌥N new note · ⌘. full screen · Esc exits full screen.
+Shortcuts: ⌘/ commands · ⌘K search · ⌘J today · ⌘⌥N new note · ⌘. full screen · Esc exits full screen · ⌘-click a link or image to open it.
 
 ## How it works
 
 - One Cloudflare Worker serves the static frontend (`public/`, no framework, no build step at deploy) and a JSON API (`src/worker.js`) backed by D1.
 - **Access control:** Cloudflare Access sits in front of the custom domain with an allow policy for a single email (one-time PIN login, 30-day session). The Worker verifies the `Cf-Access-Jwt-Assertion` JWT itself (signature against the team's JWKS, audience, issuer, expiry, owner email; see `src/access.js`). If Access were ever misconfigured, the API would still refuse. The `*.workers.dev` address is disabled.
-- The streak engine, word counter and tag parser live in `public/lib.js`, shared by the browser and the Worker and covered by tests.
+- Files are stored in D1 as 1 MB chunks (`src/files.js`) and served from `/files/<id>/<name>` behind the same Access check, with a sandboxing CSP so uploaded HTML or SVG can't run as the site.
+- The streak engine, word counter, tag parser and three-way merge live in `public/lib.js`, shared by the browser and the Worker and covered by tests.
 - The editor is CodeMirror 6, bundled once into `public/vendor/editor.js` (`npm run vendor`).
 
 Every push to `main` deploys automatically through Workers Builds (`npm run deploy`, which applies D1 migrations first).
@@ -53,5 +58,5 @@ npm test
 ## Limitations
 
 - Single owner by design: no accounts, no sharing.
-- Last write wins when the same note is edited on two devices at once.
-- No image attachments yet.
+- When both devices change the *same* line differently, both versions of that line are kept, one after the other, for you to tidy up (you're told when it happens).
+- Files live in D1 (5 GB free, shared with notes). Moving them to R2 would need R2 enabled on the account.
