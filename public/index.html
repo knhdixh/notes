@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>notes</title>
+  <meta name="description" content="Notes and a daily 750 words.">
+  <meta name="theme-color" content="#ffffff">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='white'/><rect x='14' y='7' width='3' height='18' fill='black'/></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="modulepreload" href="/vendor/editor.js">
+</head>
+<body data-screen="diary">
+  <div class="app" id="app">
+    <!-- library -->
+    <aside class="side" id="side">
+      <div class="brand"><span>notes</span><span class="cursor" aria-hidden="true"></span></div>
+      <nav class="nav" id="nav">
+        <button class="nav-row" data-view="diary"><span>today</span><span class="nav-n" id="nav-streak"></span></button>
+        <button class="nav-row" data-view="notes"><span>notes</span><span class="nav-n" id="nav-count"></span></button>
+        <button class="nav-row" data-view="trash"><span>trash</span><span class="nav-n"></span></button>
+      </nav>
+      <div class="meta side-meta"><span>Tags</span><span id="tag-count"></span></div>
+      <ul class="tags" id="tags"></ul>
+      <div class="side-foot">
+        <a href="/api/export" class="link" download>Export</a>
+        <span class="muted" id="me"></span>
+      </div>
+    </aside>
+
+    <!-- note list -->
+    <section class="list" id="list">
+      <div class="list-head">
+        <button class="back" data-back="nav" aria-label="Back">←</button>
+        <h2 id="list-title">notes</h2>
+        <button class="icon-btn" id="new-note" title="New note (⌘N)" aria-label="New note">+</button>
+      </div>
+      <label class="search">
+        <span class="sr">Search</span>
+        <input id="search" type="search" placeholder="Search" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="meta"><span id="list-label">All</span><span id="list-n"></span></div>
+      <ul class="rows" id="rows"></ul>
+      <button class="link empty-trash" id="empty-trash" hidden>Empty trash</button>
+    </section>
+
+    <!-- note editor -->
+    <section class="pane" id="note-pane" hidden>
+      <div class="bar">
+        <button class="back" data-back="list" aria-label="Back">←</button>
+        <span class="bar-status" id="note-status"></span>
+        <span class="bar-gap"></span>
+        <span class="bar-words" id="note-words"></span>
+        <button class="tool" id="pin">pin</button>
+        <button class="tool" data-toggle="focus">focus</button>
+        <button class="tool" data-toggle="typewriter">typewriter</button>
+        <button class="tool" data-toggle="full" title="⌘.">full</button>
+        <button class="tool" id="trash-note">delete</button>
+      </div>
+      <div class="trash-banner" id="trash-banner" hidden>
+        <span>In trash.</span>
+        <button class="link" id="restore">Restore</button>
+        <button class="link danger" id="purge">Delete forever</button>
+      </div>
+      <div class="editor-wrap"><div class="editor" id="note-editor"></div></div>
+    </section>
+
+    <section class="pane" id="empty-pane" hidden><p class="pane-empty">No note selected.</p></section>
+
+    <!-- diary -->
+    <section class="pane diary" id="diary-pane">
+      <div class="progress" aria-hidden="true"><span id="progress"></span></div>
+      <div class="bar">
+        <button class="back" data-back="nav" aria-label="Back">←</button>
+        <span class="bar-status" id="diary-status"></span>
+        <span class="bar-gap"></span>
+        <button class="tool" data-toggle="focus">focus</button>
+        <button class="tool" data-toggle="typewriter">typewriter</button>
+        <button class="tool" data-toggle="full" title="⌘.">full</button>
+      </div>
+      <div class="diary-body">
+        <div class="diary-main">
+          <div class="diary-head">
+            <h1 id="diary-title" aria-live="polite"></h1>
+            <div class="meta"><span id="diary-words">0 words</span><span id="diary-togo"></span></div>
+            <p class="past-note" id="past-note" hidden>Past entry. Edits don't count toward the streak. <button class="link" id="back-today">Back to today</button></p>
+          </div>
+          <div class="editor diary-editor" id="diary-editor"></div>
+        </div>
+        <aside class="rail" id="rail">
+          <div class="stat big"><span class="num-xl" id="streak">0</span><span class="label" id="streak-label">day streak</span></div>
+          <p class="hint" id="streak-hint"></p>
+          <ul class="stats">
+            <li><span>Freezes</span><span id="freezes">0</span></li>
+            <li><span>Longest</span><span id="longest">0</span></li>
+            <li><span>Days done</span><span id="done-days">0</span></li>
+            <li><span>Words</span><span id="total-words">0</span></li>
+            <li><span>Goal</span><button class="link num" id="goal">750</button></li>
+          </ul>
+          <div class="cal-head meta">
+            <button class="icon-btn small" id="cal-prev" aria-label="Previous month">←</button>
+            <span id="cal-title"></span>
+            <button class="icon-btn small" id="cal-next" aria-label="Next month">→</button>
+          </div>
+          <div class="cal" id="cal" role="grid"></div>
+          <div class="legend"><span><i class="d done"></i>done</span><span><i class="d frozen"></i>frozen</span><span><i class="d partial"></i>some</span></div>
+        </aside>
+      </div>
+    </section>
+  </div>
+  <div id="toast" class="toast" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

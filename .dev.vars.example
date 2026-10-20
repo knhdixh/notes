@@ -1,0 +1,4 @@
+# Local-only settings for `wrangler dev`. Copy to .dev.vars (never committed).
+# Skips the Cloudflare Access check locally.
+DEV_LOGIN=1
+OWNER_EMAIL=you@example.com

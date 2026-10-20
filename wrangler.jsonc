@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "notes",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-09-20",
+  // Served only on the custom domain, which Cloudflare Access protects.
+  // workers.dev stays on but redirects there, so nothing bypasses Access.
+  "routes": [{ "pattern": "notes.knhdixh.com", "custom_domain": true }],
+  "workers_dev": true,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "vars": {
+    "CANONICAL_HOST": "notes.knhdixh.com",
+    "ACCESS_TEAM_DOMAIN": "bitter-star-3315.cloudflareaccess.com",
+    "ACCESS_AUD": "effb5eee81a2bd4b48c4188baaa306e955e3a4a28c916fdcbb343aabf98f9667"
+    // OWNER_EMAIL is a secret: npx wrangler secret put OWNER_EMAIL
+  },
+  "d1_databases": [
+    { "binding": "DB", "database_name": "notes", "database_id": "7d52ae2d-bd13-4ada-9406-578e35ebd430", "migrations_dir": "migrations" }
+  ],
+  "assets": {
+    "directory": "public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  }
+}
