@@ -30,6 +30,8 @@ Shortcuts: ⌘K search · ⌘J today · ⌘⌥N new note · ⌘. full screen · 
 - The streak engine, word counter and tag parser live in `public/lib.js`, shared by the browser and the Worker and covered by tests.
 - The editor is CodeMirror 6, bundled once into `public/vendor/editor.js` (`npm run vendor`).
 
+Every push to `main` deploys automatically through Workers Builds (`npm run deploy`, which applies D1 migrations first).
+
 Stack: Cloudflare Workers · D1 · Cloudflare Access · CodeMirror 6 · plain JS · `node:test`.
 
 ## Run locally
