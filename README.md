@@ -26,7 +26,7 @@ Shortcuts: ⌘K search · ⌘J today · ⌘⌥N new note · ⌘. full screen · 
 ## How it works
 
 - One Cloudflare Worker serves the static frontend (`public/`, no framework, no build step at deploy) and a JSON API (`src/worker.js`) backed by D1.
-- **Access control:** Cloudflare Access sits in front of the custom domain with an allow policy for a single email (one-time PIN login, 30-day session). The Worker verifies the `Cf-Access-Jwt-Assertion` JWT itself (signature against the team's JWKS, audience, issuer, expiry, owner email; see `src/access.js`). If Access were ever misconfigured, the API would still refuse. `*.workers.dev` redirects to the custom domain.
+- **Access control:** Cloudflare Access sits in front of the custom domain with an allow policy for a single email (one-time PIN login, 30-day session). The Worker verifies the `Cf-Access-Jwt-Assertion` JWT itself (signature against the team's JWKS, audience, issuer, expiry, owner email; see `src/access.js`). If Access were ever misconfigured, the API would still refuse. The `*.workers.dev` address is disabled.
 - The streak engine, word counter and tag parser live in `public/lib.js`, shared by the browser and the Worker and covered by tests.
 - The editor is CodeMirror 6, bundled once into `public/vendor/editor.js` (`npm run vendor`).
 
